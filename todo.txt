@@ -1,0 +1,5 @@
+- solve carving time problem, maybe all voxels values should be capped at -1.0 and 1.0
+- modifiable voxel field size
+- evaluate performance of carving system and new entity creation
+- not generate new ProceduralEntity but modify the Arc<Mutex<>> instead
+
