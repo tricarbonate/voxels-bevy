@@ -14,7 +14,6 @@ use crate::marching_cubes;
 
 #[derive(Component)]
 pub struct ProceduralEntity {
-    // pub pos: WorldCoords,
     pub field_size: usize,
 
     // voxel field describing the geometry of the Entity
@@ -134,6 +133,9 @@ impl ProceduralEntity {
             }
             i += chunk_size;
         }
+        println!("MIN: {:?}", min);
+        println!("MAX: {:?}", max);
+        println!("field size (before change): {:?}", self.field_size);
 
         // Ensure min and max are within bounds
         min.x = min.x.max(1);
@@ -143,7 +145,8 @@ impl ProceduralEntity {
         max.y = max.y.min(self.field_size as u8 - 2);
         max.z = max.z.min(self.field_size as u8 - 2);
 
-        let new_size = (max.x - min.x + 3) as usize; // +3 for padding on both sides
+        // keep the largest
+        let new_size = ((max.x - min.x).max(max.y - min.y).max(max.z - min.z) + 3) as usize; // +3 for padding on both sides
         if new_size < self.field_size {
             self.rebuild_field(min, new_size);
         }
@@ -193,12 +196,43 @@ impl ProceduralEntity {
     pub fn increase_field_size(&mut self) {
         let start = Instant::now();
 
-        // Find the bounding box of positive voxels
         let mut min = VoxelCoords::new(u8::MAX, u8::MAX, u8::MAX);
         let mut max = VoxelCoords::new(0, 0, 0);
+        let mut has_active_voxels = false;
 
-        for (i, voxel) in self.voxel_field.iter().enumerate() {
-            if voxel.value >= 0.0 {
+        let chunk_size = 8; // AVX processes 8 floats at a time
+        let mut i = 0;
+        let threshold = unsafe { _mm256_set1_ps(0.0) };
+
+        while i + chunk_size <= self.voxel_field.len() {
+            unsafe {
+                let values_ptr = self.voxel_field.as_ptr().add(i) as *const f32;
+                let values = _mm256_load_ps(values_ptr); // Load 8 voxel values at once
+                let mask = _mm256_cmp_ps(values, threshold, _CMP_GE_OQ);
+                let bitmask = _mm256_movemask_ps(mask) as u8;
+
+                if bitmask != 0 {
+                    has_active_voxels = true;
+                    for j in 0..chunk_size {
+                        if (bitmask & (1 << j)) != 0 {
+                            let coords = self.index_to_coords(i + j);
+                            min.x = min.x.min(coords.x);
+                            min.y = min.y.min(coords.y);
+                            min.z = min.z.min(coords.z);
+                            max.x = max.x.max(coords.x);
+                            max.y = max.y.max(coords.y);
+                            max.z = max.z.max(coords.z);
+                        }
+                    }
+                }
+            }
+            i += chunk_size;
+        }
+
+        // Scalar cleanup for remaining elements (if any)
+        while i < self.voxel_field.len() {
+            if self.voxel_field[i].value >= 0.0 {
+                has_active_voxels = true;
                 let coords = self.index_to_coords(i);
                 min.x = min.x.min(coords.x);
                 min.y = min.y.min(coords.y);
@@ -207,10 +241,19 @@ impl ProceduralEntity {
                 max.y = max.y.max(coords.y);
                 max.z = max.z.max(coords.z);
             }
+            i += 1;
         }
 
-        // Calculate new size ensuring a padding of 1 voxel on each side
-        let pad = 2;
+        if !has_active_voxels {
+            min = VoxelCoords::new(0, 0, 0);
+            max = VoxelCoords::new(
+                (self.field_size - 1) as u8,
+                (self.field_size - 1) as u8,
+                (self.field_size - 1) as u8,
+            );
+        }
+
+        let pad = 3;
         let new_size_x = max.x as usize - min.x as usize + pad;
         let new_size_y = max.y as usize - min.y as usize + pad;
         let new_size_z = max.z as usize - min.z as usize + pad;
@@ -220,7 +263,6 @@ impl ProceduralEntity {
             let old_size = self.field_size;
             let old_data = std::mem::take(&mut self.voxel_field);
 
-            // Create new voxel field with increased size
             self.voxel_field = vec![
                 Voxel {
                     value: -1.0,
@@ -229,15 +271,12 @@ impl ProceduralEntity {
                 new_size * new_size * new_size
             ];
 
-            let offset = VoxelCoords::new(
-                ((new_size as u8 - (max.x - min.x)) / 2) as u8,
-                ((new_size as u8 - (max.y - min.y)) / 2) as u8,
-                ((new_size as u8 - (max.z - min.z)) / 2) as u8,
-            );
+            println!("Bounding box: min={:?}, max={:?}", min, max);
+            println!("New size: {}", new_size);
 
             for (i, voxel) in old_data.into_iter().enumerate() {
                 let old_coords = self.index_to_coords(i);
-                let new_coords = old_coords + offset;
+                let new_coords = old_coords;
                 let new_index = new_coords.z as usize
                     + new_coords.y as usize * new_size
                     + new_coords.x as usize * new_size * new_size;
@@ -272,7 +311,8 @@ impl ProceduralEntity {
                 + v.y as usize * self.field_size
                 + v.x as usize * self.field_size * self.field_size;
             if index >= self.voxel_field.len() {
-                return Vec::new();
+                continue;
+                // return Vec::new();
             }
 
             self.voxel_field[index].value -= carve_speed;
@@ -298,10 +338,7 @@ impl ProceduralEntity {
         let old_size = self.field_size;
         let mut should_increase = false;
 
-        println!("Voxel coords: {:?}", voxel_coords);
-        println!("Coordinates:");
         for c in voxel_coords.iter_around(fill_radius) {
-            println!("{:?}", c);
             let v = VoxelCoords::new(c.x as u8, c.y as u8, c.z as u8);
             if v.x >= self.field_size as u8
                 || v.y >= self.field_size as u8
@@ -356,7 +393,7 @@ impl ProceduralEntity {
                     &mut positive_voxel_count,
                 );
 
-                if positive_voxel_count > 5 {
+                if positive_voxel_count > 1 {
                     let new_entity = ProceduralEntity {
                         // pos: self.pos, // You might want to adjust the position based on the region's location
                         field_size: self.field_size, // Initialize field size
